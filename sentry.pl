@@ -1,13 +1,13 @@
-#!/usr/bin/perl
+#!/usr/bin/env perl
 use strict;
 use warnings;
 
-our $VERSION = '1.00';
+our $VERSION = '1.05';
 
 # configuration. Adjust these to taste (boolean, unless noted)
 my $root_dir              = '/var/db/sentry';
 my $add_to_tcpwrappers    = 1;
-my $add_to_pf             = 0;
+my $add_to_pf             = 1;
 my $add_to_ipfw           = 0;    # untested
 my $add_to_iptables       = 0;    # untested
 my $firewall_table        = 'sentry_blacklist';
@@ -18,7 +18,14 @@ my $protect_mua           = 1;    # dovecot POP3 & IMAP
 my $dl_url = 'https://raw.githubusercontent.com/msimerson/sentry/master/sentry.pl';
 
 # perl modules from CPAN
-#use Net::IP;  # eval'ed in _get_db_key
+my $has_netip = 0;
+eval 'use Net::IP';  ## no critic
+if ( !$@ ) {
+    $has_netip = 1;
+}
+else {
+    warn "Net::IP not installed. No IPv6 support.\n";
+};
 
 # perl built-in modules
 BEGIN { @AnyDBM_File::ISA = qw(DB_File GDBM_File NDBM_File) }
@@ -129,7 +136,6 @@ sub check_setup {
             or die "unable to create $root_dir: $!\n";
     };
 
-    do_version_check() if ( -r $root_dir && -w $root_dir );
     configure_tcpwrappers();
 
     return 1 if ( $report || $self_update );
@@ -160,7 +166,7 @@ sub configure_tcpwrappers {
     return 1 if $is_setup;
 
     my $script_loc = _get_script_location();
-    my $spawn = 'sshd : ALL : spawn perl ' . $script_loc . ' -c --ip=%a : allow';
+    my $spawn = 'sshd : ALL : spawn ' . $script_loc . ' -c --ip=%a : allow';
 
     if ( $OSNAME =~ /freebsd|linux/ ) {
 # FreeBSD & Linux have a modified tcpd, adding support for include files
@@ -180,12 +186,21 @@ $spawn\n\n";
 sub install_myself {
     my $script_loc = _get_script_location();
     print "installing $0 to $script_loc\n" if $verbose;
-    copy( $0, $script_loc ) or do {
-        warn "unable to copy $0 to $script_loc: $!\n";
+    open FHW, '>', $script_loc or do {    ## no critic
+        warn "unable to write to $script_loc: $!\n";
         return;
     };
+    open my $fhr, '<', $0 or do {
+        warn "unable to read $0: $!\n";
+        close FHW;
+        return;
+    };
+    print FHW '#!' . `which perl`;
+    while (<$fhr>) { next if /^#!/; print FHW $_; }
+    close $fhr;
+    close FHW;
     chmod 0755, $script_loc;
-    print "installed update to $script_loc\n";
+    print "installed to $script_loc\n";
     return 1;
 };
 
@@ -223,9 +238,10 @@ sub install_from_web {
     my $script_loc = _get_script_location();
 
     print "installing latest sentry.pl to $script_loc\n";
-    open my $FH, '>', $script_loc or die "error: $!\n";
-    print $FH $latest_script;
-    close $FH;
+    open FH, '>', $script_loc or die "error: $!\n"; ## no critic
+    print FH '#!' . `which perl`;
+    print FH $latest_script;
+    close FH;
     chmod 0755, $script_loc;
     my ($latest_ver) = $latest_script =~ /VERSION\s*=\s*\'([0-9\.]+)\'/;
     print "upgraded $script_loc to $latest_ver\n";
@@ -336,21 +352,45 @@ sub _get_installed_version {
     return $ver;
 };
 
-sub _get_latest_release_version {
-
+sub _get_url_lwp {
     eval 'require LWP::UserAgent'; ## no critic
     if ( $EVAL_ERROR ) {
-        warn "LWP::UserAgent not installed, cannot determine latest version\n";
-        return 0;
-    };
+        warn "LWP::UserAgent not installed\n";
+        return;
+    }
 
     my $ua = LWP::UserAgent->new( timeout => 4);
     my $response = $ua->get($dl_url);
-    $latest_script = $response->decoded_content;
-    my ($latest_ver) = $latest_script =~ /VERSION\s*=\s*\'([0-9\.]+)\'/;
+    if (!$response->is_success) {
+        warn $response->status_line;
+        return;
+    }
 
+    return $response->decoded_content;
+}
+
+sub _get_url_cli {
+    return `curl $dl_url || wget $dl_url || fetch -o - $dl_url`;
+}
+
+sub _get_latest_release_version {
+
+    my $manual_msg = "try upgrading manually with:\n
+curl -O /var/db/sentry/sentry.pl $dl_url
+  or
+fetch -o /var/db/sentry/sentry.pl $dl_url
+
+chmod 755 /var/db/sentry/sentry.pl\n";
+
+    my $doc = _get_url_lwp() || _get_url_cli();
+    if (!$doc) {
+        warn "unable to download latest script, $manual_msg";
+        return 0;
+    }
+
+    my ($latest_ver) = $doc =~ /VERSION\s*=\s*\'([0-9\.]+)\'/;
     if ( ! $latest_ver ) {
-        warn "could not determine latest version\n";
+        warn "could not determine latest version, $manual_msg\n";
         return 0;
     };
     print "most recent version: $latest_ver\n" if $verbose;
@@ -572,7 +612,6 @@ sub _unblock_pf {
     return 1;
 };
 
-
 sub _parse_ssh_logs {
     my $ssh_attempts = _get_ssh_logs();
 
@@ -610,9 +649,10 @@ sub _get_ssh_logs {
 # Anchor any regexps or otherwise exclude the user modifiable portions of the
 # log entries when parsing
 
-# Dec  3 12:14:16 pe sshd[4026]: Accepted publickey for tnpimatt from 67.171.0.90 port 45189 ssh2
+# Dec  3 12:14:16 pe   sshd[4026]: Accepted publickey for tnpimatt from 67.171.0.90 port 45189 ssh2
+# Feb  8 20:49:21 spry sshd[1550]: Failed password for invalid user pentakill from 93.62.1.201 port 33210 ssh2
 
-        my @bits = split /\s+/, $line;  # split on WS is more efficient
+        my @bits = split /\s+/, $line;  # split on WS
         if    ( $bits[5] eq 'Accepted' ) { $count{success}++  }
         elsif ( $bits[5] eq 'Invalid'  ) { $count{naughty}++  }
         elsif ( $bits[5] eq 'Failed'   ) { $count{failed}++   }
@@ -626,11 +666,12 @@ sub _get_ssh_logs {
             print "pam_unix unknown: $line\n";
         }
         elsif ( $bits[5] eq 'error:' ) {
+            $count{naughty}++ and next if $line =~ /exceeded for root/;
             if ( $bits[6] eq 'PAM:' ) {
 # FreeBSD PAM authentication
                 $count{naughty}++ and next if $line =~ /error for root/;
                 $count{failed}++ and next if $line =~ /authentication error/;
-                $count{naughty}++ and next if $line =~ /illegal user/;
+                $count{naughty}++ and next if $line =~ /(invalid|illegal) user/;
             };
             $count{errors}++;
         }
@@ -694,7 +735,6 @@ sub _get_sshd_log_location {
 # TODO: check /etc/syslog.conf for location?
     return;
 };
-
 
 sub _parse_mail_logs {
     my $attempts = _get_mail_logs() or return;
@@ -784,7 +824,7 @@ sub _parse_ftp_logs {
 
 # sample success
 #Nov  8 11:27:51 vhost0 ftpd[29864]: connection from adsl-69-209-115-194.dsl.klmzmi.ameritech.net (69.209.115.194)
-#Nov  8 11:27:51 vhost0 ftpd[29864]: FTP LOGIN FROM adsl-69-209-115-194.dsl.klmzmi.ameritech.net as rollings
+#Nov  8 11:27:51 vhost0 ftpd[29864]: FTP LOGIN FROM adsl-69-209-115-194.dsl.klmzmi.ameritech.net as rollins
 
 # sample failed
 #Nov 21 21:33:57 vhost0 ftpd[5398]: connection from 87-194-156-116.bethere.co.uk (87.194.156.116)
@@ -793,24 +833,23 @@ sub _parse_ftp_logs {
     open my $FH, '<', $logfile or warn "unable to read $logfile: $!\n" and return;
     my (%count, $rdns);
     while ( my $line = <$FH> ) {
-        chomp $line;
 
-        my ($mon, $day, $time, $host, $proc, @mess) = split /\s+/, $line;
-        my $mess = join(' ', @mess);
+        my ($mon, $day, $time, $host, $proc, $msg) = split /\s+/, $line, 6;
 
         next if ! $proc;
         next if $proc !~ /^ftpd/;
 
         if ( $rdns ) {
-            if ( $mess =~ /FROM $rdns/i ) {
-                $count{failed}++ if $line =~ /LOGIN FAILED/;
-                $count{success}++ if $line =~ /LOGIN FROM/;
+            # xferlog format has 'connection from' line followed by status
+            if ( $msg =~ /FROM $rdns/i ) {
+                $count{failed}++ if $line =~ /^FTP LOGIN FAILED/;
+                $count{success}++ if $line =~ /^FTP LOGIN FROM/;
                 $rdns = undef;
                 next;
             };
         };
 
-        ( $rdns ) = $mess =~ /connection from (.*?) \($ip\)/
+        ( $rdns ) = $msg =~ /connection from (.*?) \($ip\)/;
     };
     close $FH;
 
@@ -848,7 +887,7 @@ sub upgrade_to_db {
 
     foreach my $f ( @files ) {
         my $a_ip = join('.', (split /\//, $f)[-4,-3,-2,-1]);
-        my $key = _get_db_key( $a_ip );
+        my $key = _get_db_key( $a_ip ) or die "unable to convert ip to an int";
         my $count = _count_lines( $f );
         my $white_path = $f; $white_path =~ s/seen/white/;
         my $black_path = $f; $black_path =~ s/seen/black/;
@@ -886,12 +925,10 @@ sub _parse_db_val {
 
 sub _get_db_key {
     my $lip = shift || $ip;
-    eval 'use Net::IP';  ## no critic
-    if ( $@ ) {
-        warn "Net::IP not installed. Features degraded.\n";
+    if ( $has_netip ) {
         return unpack 'N', pack 'C4', split /\./, $lip;  # works for IPv4 only
     };
-    return Net::IP->new( $lip )->intip or die "unable to convert $lip to an integer\n";
+    return Net::IP->new( $lip )->intip;
 };
 
 sub _get_db_tie {
@@ -984,9 +1021,7 @@ Sentry - safe and effective protection against bruteforce attacks
 
 =head1 ADDITIONAL DOCUMENTATION
 
- * [[ Sentry_Installation | Installation ]]
- * [[ Sentry_FAQ | FAQ ]]
-
+See https://github.com/msimerson/sentry
 
 =head1 DESCRIPTION
 
@@ -1066,27 +1101,8 @@ Check the most recent version of Sentry against the installed version and update
 
 =head1 EXAMPLES
 
-=head2 IP REPORT
+https://github.com/msimerson/sentry/wiki/Examples
 
- $ /var/db/sentry/sentry.pl -r --ip=24.19.45.95
-    9 connections from 24.19.45.95
-        and it is whitelisted
-
-=head2 WEB SERVER REPORT
-
- $ /var/db/sentry/sentry.pl -r
-  -------- summary ---------
-  1240 unique IPs have connected 285554 times
-    40 IPs are blacklisted
-     4 IPs are whitelisted
-
-=head2 EURO MIRROR
-
- $ /var/db/sentry/sentry.pl -r
- -------- summary ---------
- 3484 unique IPs have connected 15391 times
- 1127 IPs are blacklisted
-    6 IPs are whitelisted
 
 =head1 NAUGHTY
 
@@ -1121,12 +1137,7 @@ IPs to a table/list/chain. It does this dynamically and it is up to the
 firewall administrator to add a rule that does whatever you'd like with the
 IPs in the sentry table.
 
-I use the sentry IP table like so with PF:
-
-  table sentry_blacklist persist
-  block in quick from <sentry_blacklist>
-
-That blocks all connections from anyone in the sentry table.
+See PF: https://github.com/msimerson/sentry/wiki/PF
 
 
 =head1 DIAGNOSTICS
@@ -1151,7 +1162,7 @@ Matt Simerson (msimerson@cpan.org)
 
 =head1 ACKNOWLEDGEMENTS
 
-Those who came before me: denyhosts, fail2ban, sshblacklist, et al
+Those who came before: denyhosts, fail2ban, sshblacklist, et al
 
 
 =head1 LICENCE AND COPYRIGHT
